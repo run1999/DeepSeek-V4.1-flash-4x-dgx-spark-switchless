@@ -1,0 +1,330 @@
+diff --git a/src/graph/CMakeLists.txt b/src/graph/CMakeLists.txt
+index 1dec7cb..c1f4acc 100644
+--- a/src/graph/CMakeLists.txt
++++ b/src/graph/CMakeLists.txt
+@@ -6,6 +6,7 @@ set(GRAPH_SOURCES
+     ${CMAKE_CURRENT_SOURCE_DIR}/search.cc
+     ${CMAKE_CURRENT_SOURCE_DIR}/paths.cc
+     ${CMAKE_CURRENT_SOURCE_DIR}/connect.cc
++    ${CMAKE_CURRENT_SOURCE_DIR}/ringpeer.cc
+     ${CMAKE_CURRENT_SOURCE_DIR}/rings.cc
+     ${CMAKE_CURRENT_SOURCE_DIR}/trees.cc
+ )
+diff --git a/src/graph/connect.cc b/src/graph/connect.cc
+index 11c52eb..75494ef 100644
+--- a/src/graph/connect.cc
++++ b/src/graph/connect.cc
+@@ -442,7 +442,11 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
+ 
+   // Connect rings and trees. This should also duplicate the channels.
+   NCCLCHECKGOTO(connectRings(comm, ringRecv, ringSend, ringPrev, ringNext), ret, fail);
+-  NCCLCHECKGOTO(connectTrees(comm, treeToParent, treeToChild0, treeToChild1, treePatterns), ret, fail);
++  // Switchless-ring mode: the inter-node doubling tree spans non-adjacent node
++  // pairs, so leave all tree channels disconnected (-1)
++  if (!ncclRingPeerActive(comm)) {
++    NCCLCHECKGOTO(connectTrees(comm, treeToParent, treeToChild0, treeToChild1, treePatterns), ret, fail);
++  }
+ 
+   // Duplicate ringPrev/ringNext for ncclBuildRing
+   memcpy(ringPrev + nChannels * nranks, ringPrev, nChannels * nranks * sizeof(int));
+diff --git a/src/graph/ringpeer.cc b/src/graph/ringpeer.cc
+new file mode 100644
+index 0000000..d55bd4c
+--- /dev/null
++++ b/src/graph/ringpeer.cc
+@@ -0,0 +1,179 @@
++/*************************************************************************
++ * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: MIT
++ *
++ * Switchless-ring support (original implementation on top of
++ * NVIDIA NCCL v2.30.7-1; see IMPLEMENTATION.md at the repo root).
++ *
++ * Purpose: 4-node switchless ring fabrics (each node directly cabled to its
++ * two ring neighbours only, two direct links per edge). Stock NCCL assumes a
++ * switched fabric where every NIC can reach every rank, which (a) makes
++ * ncclCommInitRank hang on QP connect timeouts towards non-adjacent ranks
++ * (tree/collnet/PAT binomial channels all require rank<->rank+2 links) and
++ * (b) leaves the second direct link of each edge idle.
++ *
++ * Environment variable (SR-3, unset => completely bypassed):
++ *   NCCL_RING_EDGE_DEVS="pair=<dev>,<dev>;cross=<dev>,<dev>"
++ * Example (4-node ring; every node sets the SAME value):
++ *   NCCL_RING_EDGE_DEVS="pair=1,3;cross=0,2"
++ *
++ * Semantics:
++ *   - The value is a deployment-wide edge rule that contains no rank id, so
++ *     one identical value fits all nodes (deployment pipelines can inject
++ *     the same env on every host). The library derives the edge class from
++ *     (myRank, peerRank) itself. Over the ring order 0-1-2-3-0 there are
++ *     two edge classes:
++ *       "pair"  edges: rank pairs {(0,1),(2,3)}
++ *       "cross" edges: rank pairs {(1,2),(3,0)}
++ *     For rank r, peer (r+1)%4 is the pair edge when r is even and the
++ *     cross edge when r is odd; peer (r+3)%4 is always the other class.
++ *   - A device index is the position of the device in NCCL's net device
++ *     enumeration, i.e. the [i] column of the "NET/IB: [i] <name>" NCCL log
++ *     lines. When NCCL_IB_HCA is used, write it in that same order (the
++ *     natural system enumeration order), so HCA-list position == device
++ *     index. Every listed device must exist on every node.
++ *   - Both keys "pair" and "cross" must appear exactly once (either order).
++ *     Each key takes 1..4 device indices. Channel c of an edge uses
++ *     dev_list[c % n] of its class list (SR-4: with the intended n=2,
++ *     channels alternate across the two direct links of the edge).
++ *   - world_size != 4: bypassed with a single INFO line (choice made to
++ *     keep accidentally-exported variables from breaking other jobs).
++ *   - Any malformed value: WARN + init failure (ncclInvalidUsage), never a
++ *     silent fallback.
++ *************************************************************************/
++
++#include <stdlib.h>
++#include <string.h>
++
++#include "comm.h"
++#include "graph.h"
++#include "param.h"
++#include "topo.h"
++#include "transport.h"  // struct ncclPeerInfo
++
++#define NCCL_RING_EDGE_DEVS_ENV "NCCL_RING_EDGE_DEVS"
++#define NCCL_RING_MAX_DEVS 4
++
++// Edge classes over the ring order 0-1-2-3-0.
++#define NCCL_RING_EDGE_PAIR 0   // rank pairs {(0,1),(2,3)}
++#define NCCL_RING_EDGE_CROSS 1  // rank pairs {(1,2),(3,0)}
++
++static struct ncclRingEdgeDevs {
++  int valid;  // parsed OK and world size eligible
++  int ndevs[2];
++  int devs[2][NCCL_RING_MAX_DEVS];
++} gRing = {0, {0, 0}, {{0}}};
++
++static bool ncclRingAdjacent(int rank, int peer, int nRanks) {
++  return peer == (rank + 1) % nRanks || peer == (rank + nRanks - 1) % nRanks;
++}
++
++// Class of the (rank, peer) edge; caller must guarantee 4-rank adjacency.
++// Even ranks pair with their (+1) peer, odd ranks cross to it.
++static int ncclRingEdgeType(int rank, int peer) {
++  return (peer == (rank + 1) % 4) ? (rank & 1) : 1 - (rank & 1);
++}
++
++// Strictly parse "pair=d1,d2;cross=d3,d4" (key order free). Returns 0 on
++// success, -1 on any error.
++static int ncclRingParse(struct ncclRingEdgeDevs* m, const char* s) {
++  m->ndevs[0] = m->ndevs[1] = 0;
++  int seen[2] = {0, 0};
++  if (*s == '\0') return -1;
++  while (1) {
++    int type;
++    if (strncmp(s, "pair=", 5) == 0) {
++      type = NCCL_RING_EDGE_PAIR;
++      s += 5;
++    } else if (strncmp(s, "cross=", 6) == 0) {
++      type = NCCL_RING_EDGE_CROSS;
++      s += 6;
++    } else {
++      return -1;
++    }
++    if (seen[type]++) return -1;  // duplicate key
++    while (1) {
++      char* end;
++      long d = strtol(s, &end, 10);
++      if (end == s || d < 0 || d >= NCCL_TOPO_MAX_NODES || m->ndevs[type] >= NCCL_RING_MAX_DEVS) return -1;
++      m->devs[type][m->ndevs[type]++] = (int)d;
++      s = end;
++      if (*s != ',') break;
++      s++;
++    }
++    if (*s == '\0') break;
++    if (*s != ';') return -1;
++    s++;
++    if (*s == '\0') return -1;  // trailing ';'
++  }
++  return (seen[NCCL_RING_EDGE_PAIR] == 1 && seen[NCCL_RING_EDGE_CROSS] == 1) ? 0 : -1;
++}
++
++// Resolve a device index to its NET topology node id.
++static ncclResult_t ncclRingDevToNetId(struct ncclTopoSystem* system, int dev, int64_t* netId) {
++  for (int n = 0; n < system->nodes[NET].count; n++) {
++    if (system->nodes[NET].nodes[n].net.dev == dev) {
++      if (netId) *netId = system->nodes[NET].nodes[n].id;
++      return ncclSuccess;
++    }
++  }
++  WARN("NCCL_RING_EDGE_DEVS: device index %d does not exist (this node has %d net devices)", dev,
++       system->nodes[NET].count);
++  return ncclInvalidUsage;
++}
++
++// Called once per communicator after the topology is built (SR-3 entry point).
++ncclResult_t ncclRingPeerInit(struct ncclComm* comm) {
++  const char* val = ncclGetEnv(NCCL_RING_EDGE_DEVS_ENV);
++  gRing.valid = 0;
++  if (val == NULL || *val == '\0') return ncclSuccess;  // bypass: stock NCCL
++  if (comm->nRanks != 4) {
++    if (comm->rank == 0)
++      INFO(NCCL_ENV, "%s set but nRanks is %d (not 4); switchless-ring mode bypassed", NCCL_RING_EDGE_DEVS_ENV,
++           comm->nRanks);
++    return ncclSuccess;  // documented bypass
++  }
++  if (ncclRingParse(&gRing, val) != 0) {
++    WARN("Invalid %s \"%s\": expected \"pair=<dev>,<dev>;cross=<dev>,<dev>\" with both keys exactly once",
++         NCCL_RING_EDGE_DEVS_ENV, val);
++    return ncclInvalidUsage;
++  }
++  for (int t = 0; t < 2; t++)
++    for (int i = 0; i < gRing.ndevs[t]; i++)
++      NCCLCHECK(ncclRingDevToNetId(comm->topo, gRing.devs[t][i], NULL));  // fail init on bad device index
++  gRing.valid = 1;
++  int prev = (comm->rank + 3) % 4, next = (comm->rank + 1) % 4;
++  INFO(NCCL_INIT | NCCL_ENV, "Switchless-ring mode active on rank %d/4: rank %d edge is %s, rank %d edge is %s (%s)",
++       comm->rank, next, ncclRingEdgeType(comm->rank, next) == NCCL_RING_EDGE_PAIR ? "pair" : "cross", prev,
++       ncclRingEdgeType(comm->rank, prev) == NCCL_RING_EDGE_PAIR ? "pair" : "cross", val);
++  return ncclSuccess;
++}
++
++bool ncclRingPeerActive(struct ncclComm* comm) {
++  return gRing.valid && comm != NULL && comm->nRanks == 4;
++}
++
++// SR-1 enforcement: cross-node NET connections are allowed to ring neighbours only.
++ncclResult_t ncclRingPeerCheckPeer(struct ncclComm* comm, int peerRank) {
++  if (peerRank < 0 || peerRank >= comm->nRanks) return ncclSuccess;  // let callers handle invalid peers
++  if (comm->peerInfo[peerRank].hostHash == comm->peerInfo[comm->rank].hostHash) return ncclSuccess;  // intra-node
++  if (ncclRingAdjacent(comm->rank, peerRank, comm->nRanks)) return ncclSuccess;
++  WARN("Switchless-ring mode: refusing cross-node NET connection rank %d -> rank %d (not ring-adjacent)", comm->rank,
++       peerRank);
++  return ncclInvalidUsage;
++}
++
++// SR-2/SR-4: force the net device of (peerRank, channelId) to the edge-class
++// list. Callers run ncclRingPeerCheckPeer first, so peerRank is adjacent.
++ncclResult_t ncclRingPeerNetDev(struct ncclComm* comm, int peerRank, int channelId, int64_t* netId, int* netDev,
++                                int* proxyRank) {
++  if (comm->peerInfo[peerRank].hostHash == comm->peerInfo[comm->rank].hostHash) return ncclSuccess;  // intra-node
++  int type = ncclRingEdgeType(comm->rank, peerRank);
++  int dev = gRing.devs[type][channelId % gRing.ndevs[type]];
++  int64_t id;
++  NCCLCHECK(ncclRingDevToNetId(comm->topo, dev, &id));
++  if (netId) *netId = id;
++  if (netDev) *netDev = dev;
++  if (proxyRank) NCCLCHECK(ncclTopoGetIntermediateRank(comm->topo, comm->rank, id, proxyRank));
++  return ncclSuccess;
++}
+diff --git a/src/graph/tuning.cc b/src/graph/tuning.cc
+index 20f7d26..d19dba8 100644
+--- a/src/graph/tuning.cc
++++ b/src/graph/tuning.cc
+@@ -217,6 +217,7 @@ static int ncclPatEnable(struct ncclComm* comm) {
+   int patEnable = ncclParamPatEnable();
+   if (comm->minCompCap < 60) return 0; // Need SM60 or higher for CUDA atomics
+   if (patEnable != 2) return patEnable;
++  if (ncclRingPeerActive(comm)) return 0; // Switchless-ring mode: PAT binomial tree needs rank<->rank+2 links
+   if (comm->nNodes != comm->nRanks) return 0; // PAT only supports 1 GPU per node
+   if (comm->netDeviceType != NCCL_NET_DEVICE_HOST) return 0;   // PAT doesn't support net device offload
+   return 1;
+diff --git a/src/include/graph.h b/src/include/graph.h
+index 4cbef50..cc100f1 100644
+--- a/src/include/graph.h
++++ b/src/include/graph.h
+@@ -216,4 +216,12 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
+ ncclResult_t ncclTopoGetAlgoTime(struct ncclComm* comm, int coll, int algorithm, int protocol, size_t nBytes,
+                                  int numPipeOps, float* time);
+ 
++// Switchless-ring support (implementation in src/graph/ringpeer.cc).
++// Bypassed entirely unless NCCL_RING_EDGE_DEVS is set and nRanks == 4.
++ncclResult_t ncclRingPeerInit(struct ncclComm* comm);
++bool ncclRingPeerActive(struct ncclComm* comm);
++ncclResult_t ncclRingPeerCheckPeer(struct ncclComm* comm, int peerRank);
++ncclResult_t ncclRingPeerNetDev(struct ncclComm* comm, int peerRank, int channelId, int64_t* netId, int* netDev,
++                                int* proxyRank);
++
+ #endif
+diff --git a/src/init.cc b/src/init.cc
+index 0c4554b..aa2af87 100644
+--- a/src/init.cc
++++ b/src/init.cc
+@@ -1151,6 +1151,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
+   NCCLCHECKGOTO(ncclTopoComputeCommCPU(comm), ret, fail);
+   // Print final topology
+   NCCLCHECKGOTO(ncclTopoPrint(comm->topo), ret, fail);
++  // Switchless-ring mode: parse/validate NCCL_RING_EDGE_DEVS (bypass if unset)
++  NCCLCHECKGOTO(ncclRingPeerInit(comm), ret, fail);
+   timers[TIMER_INIT_TOPO] = clockNano() - timers[TIMER_INIT_TOPO];
+ 
+   // Set Affinity to a CPU local the our GPU, so that all memory we allocate
+@@ -1165,6 +1167,11 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
+   if (!collNetSupport(comm)) {
+     comm->config.collnetEnable = 0;
+   }
++  // Switchless-ring mode: collnet heads connect to non-adjacent nodes; disable
++  if (ncclRingPeerActive(comm)) {
++    INFO(NCCL_INIT, "Switchless-ring mode: disabling collnet");
++    comm->config.collnetEnable = 0;
++  }
+ 
+   NCCLCHECK(ncclNvlsInit(comm));
+ 
+@@ -1185,6 +1192,21 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
+   treeGraph->maxChannels = ringGraph->nChannels;
+   NCCLCHECKGOTO(ncclTopoCompute(comm->topo, treeGraph), ret, fail);
+   NCCLCHECKGOTO(ncclTopoPrintGraph(comm->topo, treeGraph), ret, fail);
++  // Switchless-ring mode: tree channels are never connected (connectTrees is
++  // skipped in ncclTopoPostset; tree peers stay -1), so the tree algorithm
++  // must never be selected. Zero the graph bandwidths: bw==0 makes
++  // ncclTopoGetAlgoTime return -1, which enqueue.cc algo selection ignores.
++  // The tree graph itself is still searched: ncclTopoPreset, the graphInfo
++  // allgather reconciliation and the stock comm->nChannels min() in
++  // initTransportsRank all expect a fully populated tree graph; skipping the
++  // search collapsed nChannels to 0 and ncclBuildRings then failed with
++  // "ring 0 does not contain rank 1" (channels resurrected from zeroed ring
++  // tables by the NCCL_MIN_NCHANNELS floor inside ncclTopoPostset).
++  if (ncclRingPeerActive(comm)) {
++    treeGraph->bwIntra = treeGraph->bwInter = 0;
++    INFO(NCCL_INIT, "Switchless-ring mode: tree graph computed but never connected (bw zeroed, algo disabled); ring channels %d, tree channels %d",
++         ringGraph->nChannels, treeGraph->nChannels);
++  }
+ 
+   memset(collNetChainGraph, 0, sizeof(struct ncclTopoGraph));
+   collNetChainGraph->id = 2;
+@@ -1568,7 +1590,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
+     NCCLCHECKGOTO(ncclTransportTreeConnect(comm), ret, fail);
+ 
+     // Connect PAT only for communicators with 1 GPU per node
+-    if (comm->maxLocalRanks == 1) NCCLCHECKGOTO(ncclTransportPatConnect(comm), ret, fail);
++    // Switchless-ring mode: PAT binomial trees connect rank<->rank+2; skip
++    if (comm->maxLocalRanks == 1 && !ncclRingPeerActive(comm)) NCCLCHECKGOTO(ncclTransportPatConnect(comm), ret, fail);
+ 
+     // Attempt to setup NVLS
+     NCCLCHECKGOTO(ncclNvlsSetup(comm, parent), ret, fail);
+diff --git a/src/transport/net.cc b/src/transport/net.cc
+index 03bb35d..422d14f 100644
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -308,6 +308,11 @@ static ncclResult_t sendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
+   int proxyRank;
+   int64_t netId;
+   NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, peerInfo->rank, &netId, &req.netDev, &proxyRank));
++  // Switchless-ring mode: enforce neighbour-only connects + per-edge net device
++  if (ncclRingPeerActive(comm)) {
++    NCCLCHECK(ncclRingPeerCheckPeer(comm, peerInfo->rank));
++    NCCLCHECK(ncclRingPeerNetDev(comm, peerInfo->rank, channelId, &netId, &req.netDev, &proxyRank));
++  }
+   NCCLCHECK(ncclTopoCheckGdr(comm->topo, myInfo->rank, netId, 1, &req.useGdr));
+   send->conn.flags |= req.useGdr ? NCCL_DIRECT_NIC : 0;
+   if (!req.useGdr && connIndex == 0) comm->useGdr = 0;
+@@ -357,6 +362,13 @@ static ncclResult_t recvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
+   int64_t netId;
+   NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, /*peerRank=*/myInfo->rank, &netId, &req.netDev,
+                               &proxyRank));
++  // Switchless-ring mode: enforce neighbour-only connects + per-edge net device.
++  // recvSetup normally selects the receiver's own netdev; the real peer is
++  // peerInfo->rank, which is what the per-edge mapping is keyed on.
++  if (ncclRingPeerActive(comm)) {
++    NCCLCHECK(ncclRingPeerCheckPeer(comm, peerInfo->rank));
++    NCCLCHECK(ncclRingPeerNetDev(comm, peerInfo->rank, channelId, &netId, &req.netDev, &proxyRank));
++  }
+   NCCLCHECK(ncclTopoCheckGdr(comm->topo, myInfo->rank, netId, 0, &req.useGdr));
+   recv->conn.flags |= req.useGdr ? NCCL_DIRECT_NIC : 0;
+   if (!req.useGdr && connIndex == 0) comm->useGdr = 0;

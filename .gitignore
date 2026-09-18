@@ -1,0 +1,4 @@
+*.tar.gz
+*.tar.zst
+*.trace.json.gz
+.DS_Store

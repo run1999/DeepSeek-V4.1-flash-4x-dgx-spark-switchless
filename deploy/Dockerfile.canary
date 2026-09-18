@@ -1,0 +1,33 @@
+# Canary image: SGLang python tree replaced by upstream dsv4.1 branch @ f80c91a4b
+# (staged at runtime/sglang-canary/python via knapcio fetch script, ghfast mirror),
+# + branch-pinned kernels + spark_prefill_dense/indexer_chunked_v3 adapters.
+# Pip via aliyun mirror (build-time network). No BCG allowlist seds here (prefill BCG
+# is dead on the stock tree; canary carries its own graph path).
+FROM lmsysorg/sglang:dev-dsv41
+RUN mv /root/.cargo/bin/cargo /root/.cargo/bin/cargo.real 2>/dev/null; printf "#!/bin/sh\nexit 1\n" > /root/.cargo/bin/cargo; chmod +x /root/.cargo/bin/cargo; true
+RUN pip install --no-deps --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ \
+    "sglang-kernel==0.4.7" "sgl-deep-gemm==0.2.0"
+RUN rm -rf /sgl-workspace/sglang/python
+COPY runtime/sglang-canary/python /sgl-workspace/sglang/python
+RUN python3 -c "import sglang, sglang.srt.models.deepseek_v4, sglang.srt.layers.attention.deepseek_v4_backend, sglang.srt.models.deepseek_v4_dspark; print(\"import ok\")"
+WORKDIR /opt/dsv41
+COPY adapter /opt/dsv41/adapter
+RUN g++ -O2 -Wall -Wextra -Werror -std=c++17 -shared -fPIC -pthread \
+    adapter/row_store.cpp -o adapter/librow_store.so
+COPY runtime/flash_mla_sm120.canary.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/flash_mla_sm120.py
+COPY boot.py /opt/dsv41/boot.py
+COPY scripts /opt/dsv41/scripts
+COPY tests /opt/dsv41/tests
+COPY benchmarks /opt/dsv41/benchmarks
+RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.py \
+ && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_max_new_tokens.py \
+ && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_loop_abort.py \
+ && cd /opt/dsv41/tests && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_indexer_chunked_v3.py /sgl-workspace/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+ENV PYTHONPATH=/opt/dsv41/adapter \
+    MODEL_PATH=/models/DeepSeek-V4.1-Flash \
+    STATE_PATH=/state OFFLOAD_MODE=nvme DSV41_CACHE_GIB=16
+EXPOSE 8888
+HEALTHCHECK --interval=30s --timeout=30s --start-period=30m --retries=3 \
+    CMD ["python3", "-S", "/opt/dsv41/boot.py", "health"]
+ENTRYPOINT ["python3", "-u", "/opt/dsv41/boot.py"]
+CMD ["run"]
